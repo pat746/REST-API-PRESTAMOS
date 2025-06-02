@@ -54,6 +54,7 @@ export const getContratosByDni = async (req, res) => {
 
 // Crear nuevo contrato (evitar duplicados activos por beneficiario)
 export const createContrato = async (req, res) => {
+  const connection = await pool.getConnection();
   try {
     const {
       idbeneficiario,
@@ -65,49 +66,72 @@ export const createContrato = async (req, res) => {
       estado
     } = req.body;
 
-    // Validación de campos requeridos
     if (!idbeneficiario || !monto || !interes || !fechainicio || !diapago || !numcuotas) {
       return res.status(400).json({ message: "Faltan campos obligatorios" });
     }
 
-    // ✅ Verificar si el beneficiario ya tiene un contrato activo
-    const [contratosActivos] = await pool.query(
+    // Verificar contrato activo
+    const [contratosActivos] = await connection.query(
       `SELECT * FROM contratos WHERE idbeneficiario = ? AND estado = 'ACT'`,
       [idbeneficiario]
     );
 
     if (contratosActivos.length > 0) {
-      return res.status(409).json({
-        status: false,
-        message: "Este beneficiario ya tiene un contrato activo"
-      });
+      return res.status(409).json({ message: "Este beneficiario ya tiene un contrato activo" });
     }
 
-    // Insertar nuevo contrato si pasa la validación
-    const querySQL = `
-      INSERT INTO contratos
-      (idbeneficiario, monto, interes, fechainicio, diapago, numcuotas, estado)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `;
+    // Insertar contrato
+    const [result] = await connection.query(
+      `INSERT INTO contratos (idbeneficiario, monto, interes, fechainicio, diapago, numcuotas, estado)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        idbeneficiario,
+        monto,
+        interes,
+        fechainicio,
+        diapago,
+        numcuotas,
+        estado?.trim().toUpperCase() || 'ACT'
+      ]
+    );
 
-    const [results] = await pool.query(querySQL, [
-      idbeneficiario,
-      monto,
-      interes,
-      fechainicio,
-      diapago,
-      numcuotas,
-      estado?.trim().toUpperCase() || 'ACT' // asegura formato correcto
-    ]);
+    const idContrato = result.insertId;
+
+    // Calcular cuota mensual con interés (interés simple)
+   const interesMensual = interes / 100;
+   const factor = Math.pow(1 + interesMensual, numcuotas);
+   const cuota = parseFloat((monto * (interesMensual * factor) / (factor - 1)).toFixed(2));
+
+
+    // Insertar cronograma de pagos
+    const pagos = [];
+    const fechaInicio = new Date(fechainicio);
+
+    for (let i = 1; i <= numcuotas; i++) {
+      const fechaPago = new Date(fechaInicio);
+      fechaPago.setMonth(fechaInicio.getMonth() + i); // 1ra cuota el mes siguiente
+
+      pagos.push([idContrato, i, null, cuota, 0, null]);
+    }
+
+    await connection.query(
+      `INSERT INTO pagos (idcontrato, numcuota, fechapago, monto, penalidad, medio)
+       VALUES ?`,
+      [pagos]
+    );
 
     res.send({
       status: true,
-      message: "Contrato creado correctamente",
-      id: results.insertId
+      message: "Contrato y cronograma de pagos creado correctamente",
+      idContrato,
+      cuota
     });
+
   } catch (error) {
-    console.error("Error al crear contrato", error);
+    console.error("Error al crear contrato y cronograma", error);
     res.status(500).send("Error del servidor");
+  } finally {
+    connection.release();
   }
 };
 
